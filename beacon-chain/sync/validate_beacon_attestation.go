@@ -41,18 +41,34 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 	ctx context.Context,
 	pid peer.ID,
 	msg *pubsub.Message,
-) (pubsub.ValidationResult, error) {
+) (result pubsub.ValidationResult, err error) {
 	start := time.Now()
+	skipEpochStats := false
+	var auditReason string
 	defer func() {
 		attestationVerificationGossipSummary.Observe(float64(time.Since(start).Milliseconds()))
+		if skipEpochStats {
+			return
+		}
+		var reasonKey string
+		if result == pubsub.ValidationAccept {
+			reasonKey = ""
+		} else if auditReason != "" {
+			reasonKey = auditReason
+		} else {
+			reasonKey = classifyCommitteeAttGossipNonSuccess(result, err)
+		}
+		s.committeeAttGossipEpochStats.observe(s.cfg.clock, result, reasonKey)
 	}()
 
 	if pid == s.cfg.p2p.PeerID() {
+		skipEpochStats = true
 		return pubsub.ValidationAccept, nil
 	}
 	// Attestation processing requires the target block to be present in the database, so we'll skip
 	// validating or processing attestations until fully synced.
 	if s.cfg.initialSync.Syncing() {
+		auditReason = "ignore_initial_sync"
 		return pubsub.ValidationIgnore, nil
 	}
 
@@ -81,6 +97,7 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 
 	// Do not process slot 0 attestations.
 	if data.Slot == 0 {
+		auditReason = "ignore_slot_zero"
 		return pubsub.ValidationIgnore, nil
 	}
 
@@ -100,6 +117,7 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 	attKey, err := generateUnaggregatedAttCacheKey(att)
 	if err != nil {
 		log.WithError(err).Error("Could not generate cache key for attestation tracking")
+		auditReason = "ignore_cache_key_error"
 		return pubsub.ValidationIgnore, nil
 	}
 
@@ -107,6 +125,7 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 		// Verify this the first attestation received for the participating validator for the slot. This verification is here to return early if we've already seen this attestation.
 		// This verification is carried again later after all other validations to avoid TOCTOU issues.
 		if s.hasSeenUnaggregatedAtt(attKey) {
+			auditReason = "ignore_duplicate_early_check"
 			return pubsub.ValidationIgnore, nil
 		}
 		// Reject an attestation if it references an invalid block.
@@ -124,6 +143,7 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 		// Block not yet available - save attestation to pending queue for later processing
 		// when the block arrives. Return ValidationIgnore so gossip doesn't potentially penalize the peer.
 		s.savePendingAtt(att)
+		auditReason = "ignore_pending_unknown_block"
 		return pubsub.ValidationIgnore, nil
 	}
 	// Block exists - verify it's in forkchoice (i.e., it's a descendant of the finalized checkpoint)
@@ -231,6 +251,7 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 
 	if first := s.setSeenUnaggregatedAtt(attKey); !first {
 		// Another concurrent validation processed the same attestation meanwhile
+		auditReason = "ignore_duplicate_race"
 		return pubsub.ValidationIgnore, nil
 	}
 
