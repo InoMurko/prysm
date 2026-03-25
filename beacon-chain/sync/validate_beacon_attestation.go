@@ -105,11 +105,9 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 	// processing tolerance.
 	if err := helpers.ValidateAttestationTime(data.Slot, s.cfg.clock.GenesisTime(), earlyAttestationProcessingTolerance); err != nil {
 		tracing.AnnotateError(span, err)
-		auditReason = "ignore_attestation_propagation_time"
 		return pubsub.ValidationIgnore, err
 	}
 	if err := helpers.ValidateSlotTargetEpoch(data); err != nil {
-		auditReason = "reject_slot_target_epoch_mismatch"
 		return pubsub.ValidationReject, wrapAttestationError(err, att)
 	}
 
@@ -135,7 +133,6 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 			s.hasBadBlock(bytesutil.ToBytes32(data.Target.Root)) ||
 			s.hasBadBlock(bytesutil.ToBytes32(data.Source.Root)) {
 			attBadBlockCount.Inc()
-			auditReason = "reject_bad_block_root"
 			return pubsub.ValidationReject, wrapAttestationError(errors.New("attestation data references bad block root"), att)
 		}
 	}
@@ -152,47 +149,33 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 	// Block exists - verify it's in forkchoice (i.e., it's a descendant of the finalized checkpoint)
 	if !s.cfg.chain.InForkchoice(blockRoot) {
 		tracing.AnnotateError(span, blockchain.ErrNotDescendantOfFinalized)
-		auditReason = "ignore_not_descendant_of_finalized"
 		return pubsub.ValidationIgnore, blockchain.ErrNotDescendantOfFinalized
 	}
 	if err = s.cfg.chain.VerifyLmdFfgConsistency(ctx, att); err != nil {
 		tracing.AnnotateError(span, err)
 		attBadLmdConsistencyCount.Inc()
-		auditReason = "reject_lmd_ffg_inconsistent"
 		return pubsub.ValidationReject, wrapAttestationError(err, att)
 	}
 
 	preState, err := s.cfg.chain.AttestationTargetState(ctx, data.Target)
 	if err != nil {
 		tracing.AnnotateError(span, err)
-		auditReason = "ignore_attestation_target_state"
 		return pubsub.ValidationIgnore, err
 	}
 
 	validationRes, err := s.validateUnaggregatedAttTopic(ctx, att, preState, *msg.Topic)
 	if validationRes != pubsub.ValidationAccept {
-		if validationRes == pubsub.ValidationReject {
-			auditReason = "reject_subnet_or_committee_topic"
-		} else {
-			auditReason = "ignore_subnet_or_committee_topic"
-		}
 		return validationRes, wrapAttestationError(err, att)
 	}
 
 	committee, err := helpers.BeaconCommitteeFromState(ctx, preState, data.Slot, committeeIndex)
 	if err != nil {
 		tracing.AnnotateError(span, err)
-		auditReason = "ignore_beacon_committee_lookup"
 		return pubsub.ValidationIgnore, err
 	}
 
 	validationRes, err = validateAttesterData(ctx, att, committee)
 	if validationRes != pubsub.ValidationAccept {
-		if validationRes == pubsub.ValidationReject {
-			auditReason = "reject_attester_data"
-		} else {
-			auditReason = "ignore_attester_data"
-		}
 		return validationRes, wrapAttestationError(err, att)
 	}
 
@@ -206,7 +189,6 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 	if att.Version() >= version.Electra {
 		singleAtt, ok := att.(*eth.SingleAttestation)
 		if !ok {
-			auditReason = "ignore_wrong_electra_attestation_type"
 			return pubsub.ValidationIgnore, fmt.Errorf(
 				"attestation has wrong type (expected %T, got %T)",
 				&eth.SingleAttestation{}, att,
@@ -229,7 +211,6 @@ func (s *Service) validateCommitteeIndexBeaconAttestation(
 
 	validationRes, err = s.validateUnaggregatedAttWithState(ctx, attForValidation, preState)
 	if validationRes != pubsub.ValidationAccept {
-		auditReason = "reject_attestation_signature"
 		return validationRes, wrapAttestationError(err, att)
 	}
 
